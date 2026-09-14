@@ -16,6 +16,7 @@ export function useEventSocket(onEvent: (e: BotEvent) => void) {
   const timerRef = useRef<number | undefined>(undefined)
   const socketRef = useRef<WebSocket | null>(null)
   const closedRef = useRef(false)
+  const connectedBeforeRef = useRef(false)
 
   const connect = useCallback(() => {
     if (closedRef.current) return
@@ -26,6 +27,17 @@ export function useEventSocket(onEvent: (e: BotEvent) => void) {
     setState('connecting')
 
     ws.onopen = () => {
+      if (closedRef.current || socketRef.current !== ws) {
+        ws.close()
+        return
+      }
+      // A restarted server has new in-memory job state and may embed a new
+      // frontend. Reload the no-store shell rather than retaining stale UI.
+      if (connectedBeforeRef.current) {
+        window.location.reload()
+        return
+      }
+      connectedBeforeRef.current = true
       retryRef.current = 0
       setState('open')
     }
@@ -39,6 +51,7 @@ export function useEventSocket(onEvent: (e: BotEvent) => void) {
     }
 
     ws.onclose = () => {
+      if (closedRef.current || socketRef.current !== ws) return
       setState('closed')
       if (closedRef.current) return
       // Exponential backoff capped at 8s.

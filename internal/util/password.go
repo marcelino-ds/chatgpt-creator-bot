@@ -2,7 +2,6 @@ package util
 
 import (
 	"math/rand"
-	"time"
 )
 
 const (
@@ -20,19 +19,17 @@ func GeneratePassword(length int) string {
 		length = 14
 	}
 
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	password := make([]byte, length)
-	password[0] = lowerChars[r.Intn(len(lowerChars))]
-	password[1] = upperChars[r.Intn(len(upperChars))]
-	password[2] = digitChars[r.Intn(len(digitChars))]
-	password[3] = specialChars[r.Intn(len(specialChars))]
+	password[0] = lowerChars[rand.Intn(len(lowerChars))]
+	password[1] = upperChars[rand.Intn(len(upperChars))]
+	password[2] = digitChars[rand.Intn(len(digitChars))]
+	password[3] = specialChars[rand.Intn(len(specialChars))]
 
 	for i := 4; i < length; i++ {
-		password[i] = allChars[r.Intn(len(allChars))]
+		password[i] = allChars[rand.Intn(len(allChars))]
 	}
 
-	r.Shuffle(len(password), func(i, j int) {
+	rand.Shuffle(len(password), func(i, j int) {
 		password[i], password[j] = password[j], password[i]
 	})
 

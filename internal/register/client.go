@@ -1,6 +1,7 @@
 package register
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/verssache/chatgpt-creator/internal/chrome"
+	"github.com/verssache/chatgpt-creator/internal/email"
 )
 
 const (
@@ -31,6 +33,11 @@ type Client struct {
 	secChUA     string
 	printMu     *sync.Mutex
 	fileMu      *sync.Mutex
+	ctx         context.Context
+	// mailbox reads the OTP. It is provisioned by the caller because the
+	// provider issues a per-mailbox token, so the address alone cannot fetch
+	// mail.
+	mailbox *email.Mailbox
 	// logFn, when set, receives every log line instead of stdout.
 	logFn func(workerID int, tag, msg string)
 }
@@ -43,6 +50,7 @@ func NewClient(proxy, tag string, workerID int, printMu, fileMu *sync.Mutex) (*C
 	options := []tls_client.HttpClientOption{
 		tls_client.WithClientProfile(mappedProfile),
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
+		tls_client.WithTimeoutSeconds(30),
 	}
 
 	if proxy != "" {
@@ -67,6 +75,7 @@ func NewClient(proxy, tag string, workerID int, printMu, fileMu *sync.Mutex) (*C
 		ua:          ua,
 		printMu:     printMu,
 		fileMu:      fileMu,
+		ctx:         context.Background(),
 	}
 
 	c.major = profile.Major
@@ -91,7 +100,29 @@ func (c *Client) SetLogFn(fn func(workerID int, tag, msg string)) {
 	c.logFn = fn
 }
 
+// SetMailbox attaches the provisioned mailbox used to read the OTP.
+func (c *Client) SetMailbox(box *email.Mailbox) {
+	c.mailbox = box
+}
+
+// SetContext attaches a cancellation context so Stop can abort in-flight work.
+func (c *Client) SetContext(ctx context.Context) {
+	if ctx != nil {
+		c.ctx = ctx
+	}
+}
+
+func (c *Client) Context() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
 func (c *Client) do(req *http.Request) (*http.Response, error) {
+	if err := c.Context().Err(); err != nil {
+		return nil, err
+	}
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", c.ua)
 	}

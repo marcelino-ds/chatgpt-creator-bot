@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 
+	"time"
+
 	"github.com/coder/websocket"
 
 	"github.com/verssache/chatgpt-creator/internal/job"
@@ -18,14 +20,19 @@ import (
 	"github.com/verssache/chatgpt-creator/internal/webui"
 )
 
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+}
+
 // Server is the HTTP + WebSocket server.
 type Server struct {
-	mgr    *job.JobManager
-	store  *store.Store
-	addr   string
+	mgr   *job.JobManager
+	store *store.Store
+	addr  string
 
 	mu      sync.Mutex
-	clients map[*websocket.Conn]struct{}
+	clients map[*wsClient]struct{}
 
 	mux *http.ServeMux
 }
@@ -35,7 +42,7 @@ func New(addr string, st *store.Store) *Server {
 	s := &Server{
 		store:   st,
 		addr:    addr,
-		clients: make(map[*websocket.Conn]struct{}),
+		clients: make(map[*wsClient]struct{}),
 		mux:     http.NewServeMux(),
 	}
 	// The manager emits into the server so events are persisted and fanned
@@ -75,33 +82,35 @@ func (s *Server) handleEvent(e job.Event) {
 	s.broadcast(e)
 }
 
-// broadcast sends an event to every connected WebSocket client.
+// broadcast queues an event for every connected client. Writes happen on a
+// single goroutine per connection so concurrent worker logs cannot collide.
 func (s *Server) broadcast(e job.Event) {
+	payload := mustJSON(e)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for c := range s.clients {
-		go func(conn *websocket.Conn) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5_000_000_000)
-			defer cancel()
-			if err := conn.Write(ctx, websocket.MessageText, mustJSON(e)); err != nil {
-				log.Printf("ws write: %v", err)
-				s.removeClient(conn)
-			}
-		}(c)
+		select {
+		case c.send <- payload:
+		default:
+			// Slow client: drop this frame rather than blocking the job.
+		}
 	}
 }
 
-func (s *Server) addClient(c *websocket.Conn) {
+func (s *Server) addClient(c *wsClient) {
 	s.mu.Lock()
 	s.clients[c] = struct{}{}
 	s.mu.Unlock()
 }
 
-func (s *Server) removeClient(c *websocket.Conn) {
+func (s *Server) removeClient(c *wsClient) {
 	s.mu.Lock()
-	delete(s.clients, c)
+	if _, ok := s.clients[c]; ok {
+		delete(s.clients, c)
+		close(c.send)
+	}
 	s.mu.Unlock()
-	_ = c.Close(websocket.StatusNormalClosure, "removed")
+	_ = c.conn.Close(websocket.StatusNormalClosure, "removed")
 }
 
 func mustJSON(v any) []byte {
@@ -120,8 +129,8 @@ func (s *Server) Mux() http.Handler {
 func (s *Server) routes() {
 	s.mux.Handle("/", webui.Handler())
 	s.mux.HandleFunc("/ws", s.handleWebSocket)
-	s.mux.HandleFunc("/api/jobs", s.handleJobs) // POST (start), GET (list)
-	s.mux.HandleFunc("/api/jobs/", s.handleJobAction) // /{id}/pause|resume|stop
+	s.mux.HandleFunc("/api/jobs", s.handleJobs)         // POST (start), GET (list)
+	s.mux.HandleFunc("/api/jobs/", s.handleJobAction)   // /{id}/pause|resume|stop
 	s.mux.HandleFunc("/api/accounts", s.handleAccounts) // GET all accounts
 	s.mux.HandleFunc("/api/status", s.handleSnapshot)
 	s.mux.HandleFunc("/api/config", s.handleConfig)
@@ -175,12 +184,23 @@ func (s *Server) startJob(w http.ResponseWriter, r *http.Request) {
 		Password: req.Password,
 	}
 
-	if err := s.mgr.Start(cfg); err != nil {
+	id, err := s.mgr.Start(cfg)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 
-	id, status, target, attempts, success, failures, elapsed, _ := s.mgr.Snapshot()
+	if err := s.store.CreateJob(&store.Job{
+		ID:      id,
+		Target:  req.Target,
+		Workers: req.Workers,
+		Proxy:   req.Proxy,
+		Domain:  req.Domain,
+	}); err != nil {
+		log.Printf("create job: %v", err)
+	}
+
+	_, status, target, attempts, success, failures, elapsed, _ := s.mgr.Snapshot()
 	writeJSON(w, map[string]any{
 		"job_id":     id,
 		"status":     status,
@@ -280,14 +300,14 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{
-		"active":      true,
-		"job_id":      id,
-		"status":      status,
-		"target":      target,
-		"attempts":    attempts,
-		"success":     success,
-		"failures":    failures,
-		"elapsed_ms":  elapsed,
+		"active":     true,
+		"job_id":     id,
+		"status":     status,
+		"target":     target,
+		"attempts":   attempts,
+		"success":    success,
+		"failures":   failures,
+		"elapsed_ms": elapsed,
 	})
 }
 
@@ -307,14 +327,32 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ws accept: %v", err)
 		return
 	}
-	s.addClient(conn)
-	defer s.removeClient(conn)
 
-	// Keep-alive: read so we notice disconnects.
+	c := &wsClient{
+		conn: conn,
+		send: make(chan []byte, 256),
+	}
+	s.addClient(c)
+	defer s.removeClient(c)
+
+	go s.writePump(c)
+
 	ctx := r.Context()
 	for {
 		_, _, err := conn.Read(ctx)
 		if err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) writePump(c *wsClient) {
+	for payload := range c.send {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := c.conn.Write(ctx, websocket.MessageText, payload)
+		cancel()
+		if err != nil {
+			log.Printf("ws write: %v", err)
 			return
 		}
 	}

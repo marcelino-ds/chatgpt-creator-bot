@@ -1,7 +1,9 @@
 package job
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,26 +29,27 @@ type jobState struct {
 	id           string
 	target       int
 	workers      int
-	status       string // running, paused, completed, stopped, failed
+	status       string // running, paused, stopping, completed, stopped, failed
 	successCount int
 	failureCount int
 	attempts     int
 	elapsedMS    int64
 	startedAt    time.Time
 	done         chan struct{}
-	pauseCh      chan struct{} // closed when paused
-	resumeCh     chan struct{} // closed to signal resume
-	cancelCh     chan struct{} // closed when cancelled
+	ctx          context.Context
+	cancel       context.CancelFunc
+	paused       atomic.Bool
 }
 
-// Start launches a new batch registration job.
-func (m *JobManager) Start(cfg Config) error {
+// Start launches a new batch registration job and returns its id.
+func (m *JobManager) Start(cfg Config) (string, error) {
 	m.mu.Lock()
-	if m.current != nil && (m.current.status == "running" || m.current.status == "paused") {
+	if m.current != nil && (m.current.status == "running" || m.current.status == "paused" || m.current.status == "stopping") {
 		m.mu.Unlock()
-		return fmt.Errorf("a job is already active")
+		return "", fmt.Errorf("a job is already active")
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	id := uuid.New().String()
 	state := &jobState{
 		id:        id,
@@ -54,19 +57,16 @@ func (m *JobManager) Start(cfg Config) error {
 		workers:   cfg.Workers,
 		status:    "running",
 		done:      make(chan struct{}),
-		pauseCh:   make(chan struct{}),
-		resumeCh:  make(chan struct{}),
-		cancelCh:  make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
 		startedAt: time.Now(),
 	}
-	// resumeCh starts open (not paused).
-	close(state.resumeCh)
 	m.current = state
 	m.mu.Unlock()
 
 	m.statusEvent(id, "running", cfg.Target, 0, 0, 0, 0)
 	go m.run(state, cfg)
-	return nil
+	return id, nil
 }
 
 // Pause requests the active job to pause. Workers finish their current
@@ -81,7 +81,7 @@ func (m *JobManager) Pause() error {
 		return fmt.Errorf("job is not running")
 	}
 	m.current.status = "paused"
-	close(m.current.pauseCh)
+	m.current.paused.Store(true)
 	return nil
 }
 
@@ -96,22 +96,27 @@ func (m *JobManager) Resume() error {
 		return fmt.Errorf("job is not paused")
 	}
 	m.current.status = "running"
-	close(m.current.resumeCh)
+	m.current.paused.Store(false)
 	return nil
 }
 
-// Stop cancels the active job. In-flight registrations complete; queued ones
-// are dropped.
+// Stop cancels the active job. In-flight HTTP may finish the current
+// request, but OTP polling and queued attempts abort.
 func (m *JobManager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.current == nil {
 		return fmt.Errorf("no active job")
 	}
-	if m.current.status != "running" && m.current.status != "paused" {
+	if m.current.status != "running" && m.current.status != "paused" && m.current.status != "stopping" {
 		return fmt.Errorf("job is not active")
 	}
-	close(m.current.cancelCh)
+	if m.current.status == "stopping" {
+		return nil
+	}
+	m.current.status = "stopping"
+	m.current.paused.Store(false)
+	m.current.cancel()
 	return nil
 }
 
@@ -126,9 +131,20 @@ func (m *JobManager) Snapshot() (id, status string, target, attempts, success, f
 	return s.id, s.status, s.target, s.attempts, s.successCount, s.failureCount, atomic.LoadInt64(&s.elapsedMS), true
 }
 
+func (s *jobState) waitIfPaused() bool {
+	for s.paused.Load() {
+		if s.ctx.Err() != nil {
+			return false
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	return s.ctx.Err() == nil
+}
+
 // run orchestrates worker goroutines until target, cancellation, or stop.
 func (m *JobManager) run(s *jobState, cfg Config) {
 	defer close(s.done)
+	defer s.cancel()
 
 	var (
 		remaining    int64 = int64(s.target)
@@ -143,40 +159,37 @@ func (m *JobManager) run(s *jobState, cfg Config) {
 		go func(workerID int) {
 			defer wg.Done()
 			for {
-				// Pause gate: wait for resume or cancellation.
-				if s.status == "paused" {
-					select {
-					case <-s.resumeCh:
-					case <-s.cancelCh:
-						return
-					}
-				}
-
-				// Cancellation check before claiming.
-				select {
-				case <-s.cancelCh:
+				if !s.waitIfPaused() {
 					return
-				default:
+				}
+				if s.ctx.Err() != nil {
+					return
 				}
 
-				// Claim a slot.
 				if atomic.AddInt64(&remaining, -1) < 0 {
 					atomic.AddInt64(&remaining, 1)
 					return
 				}
 
-				// Check cancellation again after claiming.
-				select {
-				case <-s.cancelCh:
+				if s.ctx.Err() != nil {
 					atomic.AddInt64(&remaining, 1)
 					return
-				default:
 				}
 
 				attempt := atomic.AddInt64(&attempts, 1)
 				tag := fmt.Sprintf("%d/%d", attempt, s.target)
 
-				done, emailAddr, password, errMsg := m.registerOne(s.id, workerID, tag, cfg.Proxy, cfg.Domain, cfg.Password)
+				done, emailAddr, password, errMsg := m.registerOne(s.ctx, s.id, workerID, tag, cfg.Proxy, cfg.Domain, cfg.Password)
+
+				if s.ctx.Err() != nil {
+					if errMsg == "" {
+						errMsg = "stopped"
+					}
+					count := atomic.AddInt64(&failureCount, 1)
+					m.accountEvent(s.id, emailAddr, password, false, errMsg)
+					m.progressEvent(s.id, s.target, int(attempt), int(atomic.LoadInt64(&successCount)), int(count))
+					return
+				}
 
 				if done {
 					count := atomic.AddInt64(&successCount, 1)
@@ -188,6 +201,12 @@ func (m *JobManager) run(s *jobState, cfg Config) {
 					}
 				} else {
 					count := atomic.AddInt64(&failureCount, 1)
+					if strings.Contains(errMsg, "unsupported_email") || strings.Contains(errMsg, "registration_disallowed") {
+						parts := strings.Split(emailAddr, "@")
+						if len(parts) == 2 {
+							email.AddBlacklistDomain(parts[1])
+						}
+					}
 					m.accountEvent(s.id, emailAddr, password, false, errMsg)
 					m.progressEvent(s.id, s.target, int(attempt), int(atomic.LoadInt64(&successCount)), int(count))
 				}
@@ -199,10 +218,8 @@ func (m *JobManager) run(s *jobState, cfg Config) {
 
 	elapsed := time.Since(s.startedAt).Milliseconds()
 	finalStatus := "completed"
-	select {
-	case <-s.cancelCh:
+	if s.ctx.Err() != nil {
 		finalStatus = "stopped"
-	default:
 	}
 
 	m.mu.Lock()
@@ -227,30 +244,38 @@ func (m *JobManager) run(s *jobState, cfg Config) {
 	})
 }
 
-// registerOne runs a single registration with event-aware logging.
-func (m *JobManager) registerOne(jobID string, workerID int, tag, proxy, domain, password string) (success bool, emailAddr, pass, errMsg string) {
+func (m *JobManager) registerOne(ctx context.Context, jobID string, workerID int, tag, proxy, domain, password string) (success bool, emailAddr, pass, errMsg string) {
+	if ctx.Err() != nil {
+		return false, "", "", "stopped"
+	}
+
 	var printMu, fileMu sync.Mutex
 	client, err := register.NewClient(proxy, tag, workerID, &printMu, &fileMu)
 	if err != nil {
 		return false, "", "", fmt.Sprintf("client: %v", err)
 	}
+	client.SetContext(ctx)
 
 	client.SetLogFn(func(wid int, t, msg string) {
 		sc := 0
-		if _, err := fmt.Sscanf(msg, "%*s | %d", &sc); err == nil {
-			// swallow
-		}
 		step := msg
 		if idx := findStatusSep(msg); idx > 0 {
 			step = msg[:idx]
+			_, _ = fmt.Sscanf(msg[idx:], " | %d", &sc)
 		}
 		m.logEvent(jobID, wid, t, step, sc, "")
 	})
 
-	addr, err := email.CreateTempEmail(domain)
+	// The mailbox is provisioned up front because reading the OTP needs the
+	// provider token, not just the address.
+	mailbox, err := email.NewMailbox(ctx, domain)
 	if err != nil {
-		return false, "", "", fmt.Sprintf("email: %v", err)
+		return false, "", "", fmt.Sprintf("mailbox: %v", err)
 	}
+	defer mailbox.Close()
+
+	addr := mailbox.Address
+	client.SetMailbox(mailbox)
 
 	pass = password
 	if pass == "" {
@@ -267,7 +292,6 @@ func (m *JobManager) registerOne(jobID string, workerID int, tag, proxy, domain,
 	return true, addr, pass, ""
 }
 
-// findStatusSep returns the index of " | " that precedes a status code, or -1.
 func findStatusSep(s string) int {
 	for i := len(s) - 1; i >= 2; i-- {
 		if s[i-2] == ' ' && s[i-1] == '|' && s[i] == ' ' {

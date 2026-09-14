@@ -10,7 +10,6 @@ import (
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
-	"github.com/verssache/chatgpt-creator/internal/email"
 	"github.com/verssache/chatgpt-creator/internal/sentinel"
 	"github.com/verssache/chatgpt-creator/internal/util"
 )
@@ -212,16 +211,46 @@ func (c *Client) validateOTP(code string) (int, map[string]interface{}, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var data map[string]interface{}
-	json.Unmarshal(body, &data)
+	data, err := c.inspectAuthResponse("Validate OTP", resp)
+	return resp.StatusCode, data, err
+}
 
-	c.log(fmt.Sprintf("Validate OTP [%s]", code), resp.StatusCode)
-	return resp.StatusCode, data, nil
+// visitPage navigates to a continuation page (e.g. /about-you) to establish session state and cookies
+func (c *Client) visitPage(pageURL, referer string) error {
+	target := pageURL
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		target = authURL + target
+	}
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	c.log("Visit Continuation Page", resp.StatusCode)
+	return nil
 }
 
 // createAccount creates the user account with name and birthdate
 func (c *Client) createAccount(name, birthdate string) (int, map[string]interface{}, error) {
+	sentinelCreateAccount, err := sentinel.BuildSentinelToken(c.session, c.deviceID, "create_account", c.ua, c.secChUA, c.impersonate)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to get sentinel auth: %v", err)
+	}
+	return c.createAccountWithToken(name, birthdate, sentinelCreateAccount)
+}
+
+// createAccountWithToken performs the final create_account POST using a pre-built sentinel token
+func (c *Client) createAccountWithToken(name, birthdate, sentinelToken string) (int, map[string]interface{}, error) {
 	createURL := authURL + "/api/accounts/create_account"
 	payload := map[string]string{
 		"name":      name,
@@ -229,17 +258,12 @@ func (c *Client) createAccount(name, birthdate string) (int, map[string]interfac
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	sentinelCreateAccount, err := sentinel.BuildSentinelToken(c.session, c.deviceID, "create_account", c.ua, c.secChUA, c.impersonate)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to get sentinel auth: %v", err)
-	}
-
 	req, _ := http.NewRequest("POST", createURL, strings.NewReader(string(jsonPayload)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Referer", authURL+"/about-you")
 	req.Header.Set("Origin", authURL)
-	req.Header.Set("openai-sentinel-token", sentinelCreateAccount)
+	req.Header.Set("openai-sentinel-token", sentinelToken)
 
 	traceHeaders := util.MakeTraceHeaders()
 	for k, v := range traceHeaders {
@@ -252,12 +276,8 @@ func (c *Client) createAccount(name, birthdate string) (int, map[string]interfac
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var data map[string]interface{}
-	json.Unmarshal(body, &data)
-
-	c.log("Create Account", resp.StatusCode)
-	return resp.StatusCode, data, nil
+	data, err := c.inspectAuthResponse("Create Account", resp)
+	return resp.StatusCode, data, err
 }
 
 // callback handles the callback URL.
@@ -362,7 +382,7 @@ func (c *Client) RunRegister(emailAddr, password, name, birthdate string) error 
 
 	u, _ := url.Parse(finalURL)
 	finalPath := u.Path
-
+	c.print(fmt.Sprintf("Authorize landed on %s", finalPath))
 
 	needOTP := false
 
@@ -380,6 +400,9 @@ func (c *Client) RunRegister(emailAddr, password, name, birthdate string) error 
 		needOTP = true
 	} else if strings.Contains(finalPath, "email-verification") || strings.Contains(finalPath, "email-otp") {
 		c.print("Jump to OTP verification stage")
+		if _, _, err := c.sendOTP(); err != nil {
+			c.print(fmt.Sprintf("Send OTP failed: %v", err))
+		}
 		needOTP = true
 	} else if strings.Contains(finalPath, "about-you") {
 		c.print("Jump to fill information stage")
@@ -416,10 +439,20 @@ func (c *Client) RunRegister(emailAddr, password, name, birthdate string) error 
 	}
 
 	if needOTP {
-		otpCode, err := email.GetVerificationCode(emailAddr, 20, 3*time.Second)
+		if c.mailbox == nil {
+			return fmt.Errorf("mailbox not provisioned; cannot receive OTP")
+		}
+
+		onMail := func(subject string) {
+			c.print(fmt.Sprintf("Mail received: %s", subject))
+		}
+
+		c.print(fmt.Sprintf("Waiting for OTP at %s", emailAddr))
+		otpCode, err := c.mailbox.WaitForCode(c.Context(), 60*time.Second, onMail)
 		if err != nil {
 			return err
 		}
+		c.print(fmt.Sprintf("OTP extracted: %s", otpCode))
 
 		c.randomDelay(0.3, 0.8)
 		status, data, err := c.validateOTP(otpCode)
@@ -428,13 +461,16 @@ func (c *Client) RunRegister(emailAddr, password, name, birthdate string) error 
 		}
 
 		if status != 200 {
-			c.print("Verification code failed, retrying...")
+			c.print("Verification code rejected, requesting a new one")
 			c.sendOTP()
 			c.randomDelay(1.0, 2.0)
-			otpCode, err = email.GetVerificationCode(emailAddr, 10, 3*time.Second)
+
+			otpCode, err = c.mailbox.WaitForCode(c.Context(), 60*time.Second, onMail)
 			if err != nil {
 				return err
 			}
+			c.print(fmt.Sprintf("OTP extracted: %s", otpCode))
+
 			c.randomDelay(0.3, 0.8)
 			status, data, err = c.validateOTP(otpCode)
 			if err != nil {
@@ -444,10 +480,28 @@ func (c *Client) RunRegister(emailAddr, password, name, birthdate string) error 
 				return fmt.Errorf("verification code failed after retry (%d): %v", status, data)
 			}
 		}
+
+		var contURL string
+		if u, ok := data["continue_url"].(string); ok && u != "" {
+			contURL = u
+		} else if u, ok := data["url"].(string); ok && u != "" {
+			contURL = u
+		}
+		if contURL != "" {
+			c.randomDelay(0.3, 0.8)
+			if err := c.visitPage(contURL, authURL+"/email-verification"); err != nil {
+				c.print(fmt.Sprintf("Warning: failed to visit continuation page: %v", err))
+			}
+		}
 	}
 
 	c.randomDelay(0.5, 1.5)
-	status, data, err := c.createAccount(name, birthdate)
+	// Re-fetch fresh sentinel token right before create_account to avoid stale proof
+	sentinelCreateAccount, err := sentinel.BuildSentinelToken(c.session, c.deviceID, "create_account", c.ua, c.secChUA, c.impersonate)
+	if err != nil {
+		return fmt.Errorf("failed to get fresh sentinel auth: %v", err)
+	}
+	status, data, err := c.createAccountWithToken(name, birthdate, sentinelCreateAccount)
 	if err != nil {
 		return err
 	}
@@ -497,5 +551,10 @@ func (c *Client) completeCallback(cbURL string) error {
 
 func (c *Client) randomDelay(low, high float64) {
 	delay := low + rand.Float64()*(high-low)
-	time.Sleep(time.Duration(delay * float64(time.Second)))
+	t := time.NewTimer(time.Duration(delay * float64(time.Second)))
+	defer t.Stop()
+	select {
+	case <-c.Context().Done():
+	case <-t.C:
+	}
 }

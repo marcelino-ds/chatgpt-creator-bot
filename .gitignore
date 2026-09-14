@@ -1,6 +1,11 @@
 # Binary output
 chatgpt-creator
 chatgpt-creator.exe
+*.exe
+
+# Agent instructions
+agents.md
+AGENTS.md
 
 # OS files
 .DS_Store

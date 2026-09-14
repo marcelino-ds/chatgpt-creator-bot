@@ -994,6 +994,68 @@ body {
   }
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background:
+    radial-gradient(600px 280px at 50% 30%, rgba(77, 163, 255, 0.08), transparent 70%),
+    rgba(4, 7, 12, 0.72);
+  backdrop-filter: blur(8px);
+  animation: toastIn 0.18s ease;
+}
+
+.modal {
+  width: min(420px, 100%);
+  padding: 22px 22px 18px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-glow);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 40%),
+    var(--panel-2);
+  box-shadow: var(--shadow-2);
+  position: relative;
+}
+
+.modal::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(248, 113, 113, 0.55), transparent);
+}
+
+.modal-kicker {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: #fca5a5;
+  margin-bottom: 8px;
+}
+
+.modal h3 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  letter-spacing: -0.2px;
+}
+
+.modal p {
+  margin: 0 0 18px;
+  color: var(--fg-mid);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.modal-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
 .hint {
   font-size: 11px;
   color: var(--fg-dim);

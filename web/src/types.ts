@@ -35,6 +35,7 @@ export interface BotEvent {
 export type JobStatus =
   | 'running'
   | 'paused'
+  | 'stopping'
   | 'completed'
   | 'stopped'
   | 'failed'

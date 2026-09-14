@@ -34,11 +34,10 @@ func Handler() http.Handler {
 			return
 		}
 
-		// Hashed assets are immutable; the shell must always revalidate.
 		if strings.HasPrefix(clean, "assets/") {
 			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		} else {
-			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Cache-Control", "no-store")
 		}
 		files.ServeHTTP(w, r)
 	})
@@ -51,6 +50,6 @@ func serveIndex(w http.ResponseWriter, r *http.Request, sub fs.FS) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(b)
 }

@@ -99,7 +99,7 @@ func RunBatch(totalAccounts int, outputFile string, maxWorkers int, proxy, defau
 					atomic.AddInt64(&remaining, 1)
 					ts := time.Now().Format("15:04:05")
 
-					if strings.Contains(errStr, "unsupported_email") {
+					if strings.Contains(errStr, "unsupported_email") || strings.Contains(errStr, "registration_disallowed") {
 						parts := strings.Split(emailAddr, "@")
 						if len(parts) == 2 {
 							domain := parts[1]

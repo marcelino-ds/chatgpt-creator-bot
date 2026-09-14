@@ -37,6 +37,7 @@ const IDLE: Live = {
 }
 
 export default function App() {
+  // UI build 2: custom stop modal, no browser confirm()
   const term = useRef<TermHandle | null>(null)
   const [live, setLive] = useState<Live>(IDLE)
   const [lanes, setLanes] = useState<Record<number, WorkerLane>>({})
@@ -46,6 +47,7 @@ export default function App() {
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const [tick, setTick] = useState(0)
+  const [confirmStop, setConfirmStop] = useState(false)
 
   // form
   const [target, setTarget] = useState('5')
@@ -56,7 +58,8 @@ export default function App() {
 
   const running = live.status === 'running'
   const paused = live.status === 'paused'
-  const activeJob = running || paused
+  const stopping = live.status === 'stopping'
+  const activeJob = running || paused || stopping
 
   const flash = useCallback((m: string) => {
     setErr(m)
@@ -238,7 +241,8 @@ export default function App() {
       if (kind === 'stop') await api.stop()
       setLive((p) => ({
         ...p,
-        status: kind === 'pause' ? 'paused' : kind === 'resume' ? 'running' : p.status,
+        status:
+          kind === 'pause' ? 'paused' : kind === 'resume' ? 'running' : kind === 'stop' ? 'stopping' : p.status,
       }))
     } catch (e) {
       flash((e as Error).message)
@@ -353,15 +357,11 @@ export default function App() {
           </div>
           <button
             className="btn danger"
-            disabled={!activeJob || busy}
-            onClick={() => {
-              if (confirm('Stop the current job? Queued attempts are dropped.')) {
-                void ctrl('stop')
-              }
-            }}
+            disabled={!activeJob || busy || stopping}
+            onClick={() => setConfirmStop(true)}
             style={{ marginTop: 8 }}
           >
-            Stop
+            {stopping ? 'Stopping…' : 'Stop'}
           </button>
         </div>
 
@@ -458,7 +458,44 @@ export default function App() {
         </section>
       </main>
 
-      {err && <div className="toast">{err}</div>}
+      {err && (
+        <div className="toast" role="status">
+          {err}
+        </div>
+      )}
+
+      {confirmStop && (
+        <div className="modal-backdrop" onClick={() => setConfirmStop(false)}>
+          <div
+            className="modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="stop-title"
+          >
+            <div className="modal-kicker">confirm action</div>
+            <h3 id="stop-title">Stop this job?</h3>
+            <p>
+              In-flight workers abort after the current request. Queued attempts
+              are dropped. Accounts already written stay in history.
+            </p>
+            <div className="modal-actions">
+              <button className="btn ghost" onClick={() => setConfirmStop(false)}>
+                Keep running
+              </button>
+              <button
+                className="btn danger"
+                onClick={() => {
+                  setConfirmStop(false)
+                  void ctrl('stop')
+                }}
+              >
+                Stop job
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -524,6 +561,14 @@ function ConnPill({ conn, status }: { conn: string; status: Live['status'] }) {
       <span className="pill paused">
         <i />
         paused
+      </span>
+    )
+  }
+  if (status === 'stopping') {
+    return (
+      <span className="pill paused">
+        <i />
+        stopping
       </span>
     )
   }
